@@ -132,16 +132,17 @@ dmypy.json
 # Model checkpoints and large files
 # NOTE: GitHub has a 100MB file size limit!
 # Use Git LFS for checkpoints/*.pth files (see .gitattributes)
-# Or store models externally and download at build time
 
-# If using Git LFS, these patterns are handled by .gitattributes
-# If NOT using Git LFS, uncomment the lines below to exclude model files:
-# checkpoints/*.pth
-# checkpoints/*.pt
-# checkpoints/*.pkl
+# Allow checkpoints/*.pth (tracked by Git LFS via .gitattributes)
+# But ignore other checkpoint files
+checkpoints/*.pt
+checkpoints/*.pkl
 
-# Ignore other large files
+# Ignore .pth files elsewhere (but NOT in checkpoints/ due to Git LFS)
 *.pth
+!checkpoints/*.pth
+
+# Ignore other large file formats
 *.pt
 *.pkl
 *.h5
