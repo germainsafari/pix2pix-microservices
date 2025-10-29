@@ -1,0 +1,12 @@
+services:
+  - type: web
+    name: pix2pix-inference-service
+    runtime: docker
+    dockerfilePath: ./Dockerfile
+    dockerContext: .
+    plan: starter  # You may need to upgrade if model is too large
+    envVars:
+      - key: PORT
+        value: 8000
+    healthCheckPath: /health
+
