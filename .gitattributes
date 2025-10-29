@@ -1,3 +1,2 @@
 # Track model checkpoints with Git LFS
 checkpoints/*.pth filter=lfs diff=lfs merge=lfs -text
-
