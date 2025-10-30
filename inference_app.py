@@ -16,13 +16,16 @@ import requests
 import numpy as np
 from PIL import Image
 
+# Reduce thread fan-out on small instances
+os.environ.setdefault("OMP_NUM_THREADS", "1")
+os.environ.setdefault("MKL_NUM_THREADS", "1")
+
 import torch
 from torchvision import transforms
 
-# Silence PIL DecompressionBomb warnings on large images
 warnings.filterwarnings("ignore", category=Image.DecompressionBombWarning)
 
-# -------- Configuration --------
+# -------- Config tuned for low-memory CPU --------
 MODEL_PATH: str = os.environ.get("MODEL_PATH", "checkpoints/latest_net_G.pth")
 MODEL_ARCH: str = os.environ.get("MODEL_ARCH", "unet_256")
 NORM_LAYER: str = os.environ.get("NORM_LAYER", "instance")
@@ -30,29 +33,30 @@ INPUT_NC: int = int(os.environ.get("INPUT_NC", "3"))
 OUTPUT_NC: int = int(os.environ.get("OUTPUT_NC", "3"))
 NGF: int = int(os.environ.get("NGF", "64"))
 
-TILE_SIZE: int = int(os.environ.get("TILE_SIZE", "512"))
+# Smaller tiles keep memory smooth on tiny instances
+TILE_SIZE: int = int(os.environ.get("TILE_SIZE", "256"))
 TILE_OVERLAP: int = int(os.environ.get("TILE_OVERLAP", "64"))
 DEFAULT_FORMAT: str = os.environ.get("DEFAULT_FORMAT", "PNG")
 JPEG_QUALITY: int = int(os.environ.get("JPEG_QUALITY", "95"))
 
-# Memory safety
-MAX_PIXELS_DIRECT: int = int(os.environ.get("MAX_PIXELS_DIRECT", str(4096 * 4096)))
+# Always tile to avoid big allocations
+MAX_PIXELS_DIRECT: int = 0
 
 # Network settings
-FETCH_TIMEOUT_SECS: int = int(os.environ.get("FETCH_TIMEOUT_SECS", "20"))
-HEAD_TIMEOUT_SECS: int = int(os.environ.get("HEAD_TIMEOUT_SECS", "5"))
-MAX_BODY_BYTES: int = int(os.environ.get("MAX_BODY_BYTES", str(25 * 1024 * 1024)))  # 25MB
+FETCH_TIMEOUT_SECS: int = int(os.environ.get("FETCH_TIMEOUT_SECS", "25"))
+HEAD_TIMEOUT_SECS: int = int(os.environ.get("HEAD_TIMEOUT_SECS", "6"))
+MAX_BODY_BYTES: int = int(os.environ.get("MAX_BODY_BYTES", str(25 * 1024 * 1024)))
 
-# Device
+# Device and threads
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+torch.set_num_threads(int(os.environ.get("TORCH_NUM_THREADS", "1")))
 
-# Logger
 logger = logging.getLogger("pix2pix")
 if not logger.handlers:
     logging.basicConfig(level=logging.INFO)
 logger.setLevel(logging.INFO)
 
-# -------- Import model factory from your repo --------
+# -------- Import model factory --------
 try:
     current_dir = os.path.dirname(os.path.abspath(__file__))
     if current_dir not in sys.path:
@@ -62,12 +66,12 @@ except Exception as e:
     print(f"Failed to import define_G from models.networks: {e}")
     raise
 
-# -------- FastAPI app --------
-app = FastAPI(title="Pix2Pix Inference Service", version="2.1")
+# -------- FastAPI --------
+app = FastAPI(title="Pix2Pix Inference Service", version="2.2")
 
 class ImageRequest(BaseModel):
     image_url: str
-    output_format: Optional[str] = None   # "PNG" or "JPEG"
+    output_format: Optional[str] = None
     jpeg_quality: Optional[int] = None
 
 class ImageBytesRequest(BaseModel):
@@ -75,11 +79,10 @@ class ImageBytesRequest(BaseModel):
     output_format: Optional[str] = None
     jpeg_quality: Optional[int] = None
 
-netG = None  # global model handle
+netG = None
 
 # -------- Helpers --------
 def _weight_checksum(state_dict: Dict[str, torch.Tensor]) -> str:
-    """Small checksum to confirm the exact weights loaded."""
     m = hashlib.md5()
     for k in sorted(state_dict.keys()):
         t = state_dict[k]
@@ -89,9 +92,8 @@ def _weight_checksum(state_dict: Dict[str, torch.Tensor]) -> str:
 
 def _to_tensor_transform():
     return transforms.Compose([
-        transforms.ToTensor(),                          # HWC [0,255] -> CHW [0,1]
-        transforms.Normalize((0.5, 0.5, 0.5),
-                             (0.5, 0.5, 0.5))          # [0,1] -> [-1,1]
+        transforms.ToTensor(),
+        transforms.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5))
     ])
 
 def _hann_window_2d(h: int, w: int) -> np.ndarray:
@@ -104,13 +106,11 @@ def _hann_window_2d(h: int, w: int) -> np.ndarray:
     return np.sqrt(np.outer(wy, wx)).astype(np.float32)
 
 def pad_to_multiple_reflect(img: Image.Image, block: int) -> Tuple[Image.Image, Dict[str, int]]:
-    """Pad to multiple of block with reflection to avoid border contamination."""
     w, h = img.size
     new_w = math.ceil(w / block) * block
     new_h = math.ceil(h / block) * block
     if new_w == w and new_h == h:
         return img, {"orig_w": w, "orig_h": h, "pad_left": 0, "pad_top": 0, "new_w": w, "new_h": h}
-
     arr = np.array(img)
     pad_left = (new_w - w) // 2
     pad_right = new_w - w - pad_left
@@ -135,24 +135,17 @@ def restore_to_original(fake_img: Image.Image, meta: Dict[str, int]) -> Image.Im
     return fake_img.crop((L, T, right, bottom))
 
 def run_model_on_tensor(model: torch.nn.Module, tensor_bchw: torch.Tensor) -> torch.Tensor:
-    """Forward pass that returns de-normalized [0,1] CHW on CPU."""
     with torch.no_grad():
-        out = model(tensor_bchw.to(DEVICE))[0].cpu()     # CHW in [-1,1]
-        out = (out + 1.0) / 2.0                          # CHW in [0,1]
+        out = model(tensor_bchw.to(DEVICE))[0].cpu()
+        out = (out + 1.0) / 2.0
         out = torch.clamp(out, 0.0, 1.0)
     return out
-
-def inference_no_tiling(model: torch.nn.Module, img: Image.Image) -> Image.Image:
-    to_tensor = _to_tensor_transform()
-    t = to_tensor(img).unsqueeze(0)
-    out = run_model_on_tensor(model, t).permute(1, 2, 0).numpy()  # HWC
-    return Image.fromarray((out * 255.0 + 0.5).astype(np.uint8), mode="RGB")
 
 def inference_tiled_blend(model: torch.nn.Module, img: Image.Image, tile: int, overlap: int) -> Image.Image:
     W, H = img.size
     acc = np.zeros((H, W, 3), dtype=np.float32)
     wacc = np.zeros((H, W, 1), dtype=np.float32)
-    win_full = _hann_window_2d(tile, tile)[..., None]  # HxW×1
+    win_full = _hann_window_2d(tile, tile)[..., None]
     to_tensor = _to_tensor_transform()
 
     y = 0
@@ -195,7 +188,6 @@ def inference_tiled_blend(model: torch.nn.Module, img: Image.Image, tile: int, o
     return Image.fromarray((out * 255.0 + 0.5).astype(np.uint8), mode="RGB")
 
 def _verify_public_url(url: str) -> None:
-    """Fast check to fail early on dead or private URLs."""
     try:
         r = requests.head(url, timeout=HEAD_TIMEOUT_SECS, allow_redirects=True)
         if r.status_code >= 400:
@@ -244,7 +236,7 @@ def load_model() -> torch.nn.Module:
     print(f"Model ready on {DEVICE}: arch={MODEL_ARCH} norm={NORM_LAYER}")
     return netG
 
-# -------- FastAPI lifecycle --------
+# -------- Startup --------
 @app.on_event("startup")
 async def _startup():
     try:
@@ -258,13 +250,12 @@ async def _startup():
 def health():
     return {"status": "ok", "model_loaded": netG is not None, "device": str(DEVICE)}
 
-# -------- Inference endpoints --------
+# -------- Endpoints --------
 @app.post("/process")
 async def process(req: ImageRequest):
     if netG is None:
         raise HTTPException(status_code=503, detail="Model not loaded")
 
-    # A. Fetch image by URL
     try:
         logger.info(f"Fetching URL: {req.image_url[:140]}")
         _verify_public_url(req.image_url)
@@ -274,6 +265,7 @@ async def process(req: ImageRequest):
         if not content:
             raise HTTPException(status_code=400, detail="Fetched image content is empty.")
         img = Image.open(io.BytesIO(content)).convert("RGB")
+        logger.info(f"Image opened size=({img.width},{img.height})")
     except HTTPException:
         raise
     except requests.exceptions.Timeout:
@@ -283,20 +275,14 @@ async def process(req: ImageRequest):
     except Exception:
         raise HTTPException(status_code=400, detail="Invalid image data")
 
-    # B. Pad
     padded_img, meta = pad_to_multiple_reflect(img, TILE_SIZE)
+    logger.info(f"Padded to {padded_img.size} with tile={TILE_SIZE}, overlap={TILE_OVERLAP}")
 
-    # C. Choose tiling or full pass
-    total_pixels = padded_img.width * padded_img.height
-    if total_pixels <= MAX_PIXELS_DIRECT:
-        out_padded = inference_no_tiling(netG, padded_img)
-    else:
-        out_padded = inference_tiled_blend(netG, padded_img, TILE_SIZE, TILE_OVERLAP)
+    out_padded = inference_tiled_blend(netG, padded_img, TILE_SIZE, TILE_OVERLAP)
+    logger.info("Tiled inference complete")
 
-    # D. Restore original dimensions
     restored = restore_to_original(out_padded, meta)
 
-    # E. Encode
     fmt = (req.output_format or DEFAULT_FORMAT).upper()
     buf = io.BytesIO()
     if fmt == "JPEG":
@@ -313,7 +299,6 @@ async def process(req: ImageRequest):
 
 @app.post("/process_bytes")
 async def process_bytes(req: ImageBytesRequest):
-    """Pass image bytes as base64 to avoid remote fetch and 502s from cross cloud access."""
     if netG is None:
         raise HTTPException(status_code=503, detail="Model not loaded")
 
@@ -325,19 +310,14 @@ async def process_bytes(req: ImageBytesRequest):
         if len(raw) > MAX_BODY_BYTES:
             raise HTTPException(status_code=413, detail="Image too large")
         img = Image.open(io.BytesIO(raw)).convert("RGB")
+        logger.info(f"Received bytes image size=({img.width},{img.height})")
     except HTTPException:
         raise
     except Exception:
         raise HTTPException(status_code=400, detail="Invalid base64 image")
 
     padded_img, meta = pad_to_multiple_reflect(img, TILE_SIZE)
-
-    total_pixels = padded_img.width * padded_img.height
-    if total_pixels <= MAX_PIXELS_DIRECT:
-        out_padded = inference_no_tiling(netG, padded_img)
-    else:
-        out_padded = inference_tiled_blend(netG, padded_img, TILE_SIZE, TILE_OVERLAP)
-
+    out_padded = inference_tiled_blend(netG, padded_img, TILE_SIZE, TILE_OVERLAP)
     restored = restore_to_original(out_padded, meta)
 
     fmt = (req.output_format or DEFAULT_FORMAT).upper()
