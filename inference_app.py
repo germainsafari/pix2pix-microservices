@@ -16,7 +16,7 @@ import requests
 import numpy as np
 from PIL import Image
 
-# Reduce thread fan-out on small instances
+# Keep CPU memory stable on small instances
 os.environ.setdefault("OMP_NUM_THREADS", "1")
 os.environ.setdefault("MKL_NUM_THREADS", "1")
 
@@ -25,7 +25,7 @@ from torchvision import transforms
 
 warnings.filterwarnings("ignore", category=Image.DecompressionBombWarning)
 
-# -------- Config tuned for low-memory CPU --------
+# -------- Config --------
 MODEL_PATH: str = os.environ.get("MODEL_PATH", "checkpoints/latest_net_G.pth")
 MODEL_ARCH: str = os.environ.get("MODEL_ARCH", "unet_256")
 NORM_LAYER: str = os.environ.get("NORM_LAYER", "instance")
@@ -33,21 +33,21 @@ INPUT_NC: int = int(os.environ.get("INPUT_NC", "3"))
 OUTPUT_NC: int = int(os.environ.get("OUTPUT_NC", "3"))
 NGF: int = int(os.environ.get("NGF", "64"))
 
-# Smaller tiles keep memory smooth on tiny instances
-TILE_SIZE: int = int(os.environ.get("TILE_SIZE", "256"))
-TILE_OVERLAP: int = int(os.environ.get("TILE_OVERLAP", "64"))
+# Tiling tuned for quality
+TILE_SIZE: int = int(os.environ.get("TILE_SIZE", "512"))          # main tile size
+TILE_OVERLAP: int = int(os.environ.get("TILE_OVERLAP", "128"))    # paste overlap
+TILE_HALO: int = int(os.environ.get("TILE_HALO", "64"))           # extra context fed to model
 DEFAULT_FORMAT: str = os.environ.get("DEFAULT_FORMAT", "PNG")
 JPEG_QUALITY: int = int(os.environ.get("JPEG_QUALITY", "95"))
 
-# Always tile to avoid big allocations
-MAX_PIXELS_DIRECT: int = 0
+# Memory policy: allow full-image pass only for small inputs
+MAX_PIXELS_DIRECT: int = int(os.environ.get("MAX_PIXELS_DIRECT", str(2048 * 2048)))
 
-# Network settings
+# Networking
 FETCH_TIMEOUT_SECS: int = int(os.environ.get("FETCH_TIMEOUT_SECS", "25"))
 HEAD_TIMEOUT_SECS: int = int(os.environ.get("HEAD_TIMEOUT_SECS", "6"))
 MAX_BODY_BYTES: int = int(os.environ.get("MAX_BODY_BYTES", str(25 * 1024 * 1024)))
 
-# Device and threads
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 torch.set_num_threads(int(os.environ.get("TORCH_NUM_THREADS", "1")))
 
@@ -67,7 +67,7 @@ except Exception as e:
     raise
 
 # -------- FastAPI --------
-app = FastAPI(title="Pix2Pix Inference Service", version="2.2")
+app = FastAPI(title="Pix2Pix Inference Service", version="3.0")
 
 class ImageRequest(BaseModel):
     image_url: str
@@ -101,8 +101,7 @@ def _hann_window_2d(h: int, w: int) -> np.ndarray:
         return np.ones((h, w), dtype=np.float32)
     y = np.linspace(0.0, np.pi, h, dtype=np.float32)
     x = np.linspace(0.0, np.pi, w, dtype=np.float32)
-    wy = np.sin(y) ** 2
-    wx = np.sin(x) ** 2
+    wy, wx = np.sin(y) ** 2, np.sin(x) ** 2
     return np.sqrt(np.outer(wy, wx)).astype(np.float32)
 
 def pad_to_multiple_reflect(img: Image.Image, block: int) -> Tuple[Image.Image, Dict[str, int]]:
@@ -136,17 +135,48 @@ def restore_to_original(fake_img: Image.Image, meta: Dict[str, int]) -> Image.Im
 
 def run_model_on_tensor(model: torch.nn.Module, tensor_bchw: torch.Tensor) -> torch.Tensor:
     with torch.no_grad():
-        out = model(tensor_bchw.to(DEVICE))[0].cpu()
+        out = model(tensor_bchw.to(DEVICE))[0].cpu()  # CHW [-1,1]
         out = (out + 1.0) / 2.0
         out = torch.clamp(out, 0.0, 1.0)
     return out
 
-def inference_tiled_blend(model: torch.nn.Module, img: Image.Image, tile: int, overlap: int) -> Image.Image:
+# --- Context-aware tiling ---
+def inference_tiled_halo(model: torch.nn.Module, img: Image.Image,
+                         tile: int, overlap: int, halo: int) -> Image.Image:
+    """
+    For each tile region [x:x+tile, y:y+tile], we build a larger reflect-padded crop
+    of size (tile+2*halo), run the model on that, then crop back to the center tile.
+    We still feather with a Hann window, but much lighter, since halos remove seams.
+    """
     W, H = img.size
+    to_tensor = _to_tensor_transform()
+
+    # Accumulators
     acc = np.zeros((H, W, 3), dtype=np.float32)
     wacc = np.zeros((H, W, 1), dtype=np.float32)
-    win_full = _hann_window_2d(tile, tile)[..., None]
-    to_tensor = _to_tensor_transform()
+
+    # Light feather only across the paste area (not the halo)
+    win = _hann_window_2d(tile, tile)[..., None].astype(np.float32)
+
+    # Preconvert once for fast reflect padding
+    base = np.array(img)
+
+    def crop_with_reflect(arr, x0, y0, x1, y1):
+        # returns an array of shape (y1 - y0, x1 - x0, 3) using reflect outside bounds
+        pad_left = max(0, -x0)
+        pad_top = max(0, -y0)
+        pad_right = max(0, x1 - W)
+        pad_bottom = max(0, y1 - H)
+        x0c, y0c = max(0, x0), max(0, y0)
+        x1c, y1c = min(W, x1), min(H, y1)
+        crop = base[y0c:y1c, x0c:x1c, :]
+        if pad_left or pad_right or pad_top or pad_bottom:
+            crop = np.pad(
+                crop,
+                ((pad_top, pad_bottom), (pad_left, pad_right), (0, 0)),
+                mode="reflect",
+            )
+        return crop
 
     y = 0
     while True:
@@ -157,19 +187,22 @@ def inference_tiled_blend(model: torch.nn.Module, img: Image.Image, tile: int, o
             tile_w = min(tile, W - x)
             x0, x1 = x, x + tile_w
 
-            patch = img.crop((x0, y0, x1, y1))
-            if tile_w != tile or tile_h != tile:
-                pnp = np.array(patch)
-                pr = tile - tile_w
-                pb = tile - tile_h
-                pnp = np.pad(pnp, ((0, pb), (0, pr), (0, 0)), mode="reflect")
-                patch = Image.fromarray(pnp, "RGB")
+            # Build halo region for inference
+            hx0, hy0 = x0 - halo, y0 - halo
+            hx1, hy1 = x0 + tile_w + halo, y0 + tile_h + halo
+            halo_arr = crop_with_reflect(base, hx0, hy0, hx1, hy1)
 
-            t = to_tensor(patch).unsqueeze(0)
-            out = run_model_on_tensor(model, t).permute(1, 2, 0).numpy()
-            out = out[:tile_h, :tile_w, :]
+            # If edge makes halo smaller than requested, it's already reflect padded
+            halo_img = Image.fromarray(halo_arr, "RGB")
 
-            wtile = win_full[:tile_h, :tile_w, :].astype(np.float32)
+            # Run model on halo
+            t = to_tensor(halo_img).unsqueeze(0)
+            out_halo = run_model_on_tensor(model, t).permute(1, 2, 0).numpy()  # HWC
+            # Crop center area corresponding to the original tile region
+            out = out_halo[halo:halo+tile_h, halo:halo+tile_w, :]
+
+            # Feather paste into accumulator
+            wtile = win[:tile_h, :tile_w, :]
             acc[y0:y1, x0:x1, :] += out * wtile
             wacc[y0:y1, x0:x1, :] += wtile
 
@@ -186,18 +219,6 @@ def inference_tiled_blend(model: torch.nn.Module, img: Image.Image, tile: int, o
 
     out = (acc / np.maximum(wacc, 1e-8)).clip(0.0, 1.0)
     return Image.fromarray((out * 255.0 + 0.5).astype(np.uint8), mode="RGB")
-
-def _verify_public_url(url: str) -> None:
-    try:
-        r = requests.head(url, timeout=HEAD_TIMEOUT_SECS, allow_redirects=True)
-        if r.status_code >= 400:
-            rg = requests.get(url, timeout=HEAD_TIMEOUT_SECS, headers={"Range": "bytes=0-0"})
-            if rg.status_code >= 400:
-                raise HTTPException(status_code=400, detail=f"Image URL not fetchable. Status {r.status_code}/{rg.status_code}")
-    except requests.exceptions.Timeout:
-        raise HTTPException(status_code=408, detail="Timeout verifying image URL")
-    except requests.exceptions.RequestException as e:
-        raise HTTPException(status_code=400, detail=f"Bad image URL or blocked from server. {e}")
 
 # -------- Model loading --------
 def load_model() -> torch.nn.Module:
@@ -250,12 +271,26 @@ async def _startup():
 def health():
     return {"status": "ok", "model_loaded": netG is not None, "device": str(DEVICE)}
 
+# -------- Networking helpers --------
+def _verify_public_url(url: str) -> None:
+    try:
+        r = requests.head(url, timeout=HEAD_TIMEOUT_SECS, allow_redirects=True)
+        if r.status_code >= 400:
+            rg = requests.get(url, timeout=HEAD_TIMEOUT_SECS, headers={"Range": "bytes=0-0"})
+            if rg.status_code >= 400:
+                raise HTTPException(status_code=400, detail=f"Image URL not fetchable. Status {r.status_code}/{rg.status_code}")
+    except requests.exceptions.Timeout:
+        raise HTTPException(status_code=408, detail="Timeout verifying image URL")
+    except requests.exceptions.RequestException as e:
+        raise HTTPException(status_code=400, detail=f"Bad image URL or blocked from server. {e}")
+
 # -------- Endpoints --------
 @app.post("/process")
 async def process(req: ImageRequest):
     if netG is None:
         raise HTTPException(status_code=503, detail="Model not loaded")
 
+    # Fetch
     try:
         logger.info(f"Fetching URL: {req.image_url[:140]}")
         _verify_public_url(req.image_url)
@@ -275,11 +310,19 @@ async def process(req: ImageRequest):
     except Exception:
         raise HTTPException(status_code=400, detail="Invalid image data")
 
+    # Pad to TILE_SIZE multiple so tiles align nicely
     padded_img, meta = pad_to_multiple_reflect(img, TILE_SIZE)
-    logger.info(f"Padded to {padded_img.size} with tile={TILE_SIZE}, overlap={TILE_OVERLAP}")
+    logger.info(f"Padded to {padded_img.size} | tile={TILE_SIZE} overlap={TILE_OVERLAP} halo={TILE_HALO}")
 
-    out_padded = inference_tiled_blend(netG, padded_img, TILE_SIZE, TILE_OVERLAP)
-    logger.info("Tiled inference complete")
+    # Full pass only for small inputs
+    total_pixels = padded_img.width * padded_img.height
+    if total_pixels <= MAX_PIXELS_DIRECT:
+        to_tensor = _to_tensor_transform()
+        t = to_tensor(padded_img).unsqueeze(0)
+        out_padded = run_model_on_tensor(netG, t).permute(1, 2, 0).numpy()
+        out_padded = Image.fromarray((out_padded * 255.0 + 0.5).astype(np.uint8), mode="RGB")
+    else:
+        out_padded = inference_tiled_halo(netG, padded_img, TILE_SIZE, TILE_OVERLAP, TILE_HALO)
 
     restored = restore_to_original(out_padded, meta)
 
@@ -317,7 +360,7 @@ async def process_bytes(req: ImageBytesRequest):
         raise HTTPException(status_code=400, detail="Invalid base64 image")
 
     padded_img, meta = pad_to_multiple_reflect(img, TILE_SIZE)
-    out_padded = inference_tiled_blend(netG, padded_img, TILE_SIZE, TILE_OVERLAP)
+    out_padded = inference_tiled_halo(netG, padded_img, TILE_SIZE, TILE_OVERLAP, TILE_HALO)
     restored = restore_to_original(out_padded, meta)
 
     fmt = (req.output_format or DEFAULT_FORMAT).upper()
