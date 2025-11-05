@@ -10,18 +10,17 @@ import base64
 import hashlib
 import warnings
 import logging
-from typing import Dict, Tuple, Optional
+from typing import Dict, Tuple, Optional, List
 
 import requests
 import numpy as np
 from PIL import Image
 
-# Keep CPU memory stable on small instances
+# Keep CPU stable on small instances
 os.environ.setdefault("OMP_NUM_THREADS", "1")
 os.environ.setdefault("MKL_NUM_THREADS", "1")
 
 import torch
-from torchvision import transforms
 
 warnings.filterwarnings("ignore", category=Image.DecompressionBombWarning)
 
@@ -35,10 +34,11 @@ INPUT_NC: int = int(os.environ.get("INPUT_NC", "3"))
 OUTPUT_NC: int = int(os.environ.get("OUTPUT_NC", "3"))
 NGF: int = int(os.environ.get("NGF", "64"))
 
-# Tiling tuned for quality on CPU
+# Quality tiling with batching
 TILE_SIZE: int = int(os.environ.get("TILE_SIZE", "512"))
 TILE_OVERLAP: int = int(os.environ.get("TILE_OVERLAP", "128"))
-TILE_HALO: int = int(os.environ.get("TILE_HALO", "128"))  # context fed to model around each tile
+TILE_HALO: int = int(os.environ.get("TILE_HALO", "128"))
+TILE_BATCH: int = max(1, int(os.environ.get("TILE_BATCH", "8")))  # process this many tiles at once
 
 DEFAULT_FORMAT: str = os.environ.get("DEFAULT_FORMAT", "PNG")
 JPEG_QUALITY: int = int(os.environ.get("JPEG_QUALITY", "95"))
@@ -62,7 +62,7 @@ elif MODEL_ARCH.endswith("128"):
 elif MODEL_ARCH.endswith("64"):
     MODEL_STRIDE = 64
 else:
-    MODEL_STRIDE = 256  # safe default for pix2pix unet_256
+    MODEL_STRIDE = 256
 
 # Logger
 logger = logging.getLogger("pix2pix")
@@ -71,7 +71,7 @@ if not logger.handlers:
 logger.setLevel(logging.INFO)
 
 # =========================
-# Import model factory from your repo
+# Import model factory
 # =========================
 try:
     current_dir = os.path.dirname(os.path.abspath(__file__))
@@ -85,7 +85,7 @@ except Exception as e:
 # =========================
 # FastAPI app
 # =========================
-app = FastAPI(title="Pix2Pix Inference Service", version="3.1")
+app = FastAPI(title="Pix2Pix Inference Service", version="3.2-batched")
 
 class ImageRequest(BaseModel):
     image_url: str
@@ -109,13 +109,6 @@ def _weight_checksum(state_dict: Dict[str, torch.Tensor]) -> str:
         m.update(k.encode("utf-8"))
         m.update(t.cpu().numpy().tobytes())
     return m.hexdigest()[:12]
-
-def _to_tensor_transform():
-    return transforms.Compose([
-        transforms.ToTensor(),                         # HWC [0,255] -> CHW [0,1]
-        transforms.Normalize((0.5, 0.5, 0.5),
-                             (0.5, 0.5, 0.5))         # [0,1] -> [-1,1]
-    ])
 
 def _hann_window_2d(h: int, w: int) -> np.ndarray:
     if h <= 1 or w <= 1:
@@ -168,42 +161,65 @@ def restore_to_original(fake_img: Image.Image, meta: Dict[str, int]) -> Image.Im
                               min(fake_img.width, cx + half_w), min(fake_img.height, cy + half_h)))
     return fake_img.crop((L, T, right, bottom))
 
+# Fast NumPy -> Torch normalize to [-1, 1]
+def _np_to_input_tensor(arr_rgb_uint8: np.ndarray) -> torch.Tensor:
+    # arr: HxWx3 uint8
+    t = torch.from_numpy(arr_rgb_uint8).permute(2, 0, 1).to(torch.float32)  # CHW
+    t = t / 255.0
+    t = t * 2.0 - 1.0
+    return t
+
+def _tensor_to_uint8_image(t_chw_01: torch.Tensor) -> np.ndarray:
+    # clamp [0,1], convert to uint8 HxWx3
+    t = torch.clamp(t_chw_01, 0.0, 1.0)
+    t = (t * 255.0 + 0.5).to(torch.uint8)
+    return t.permute(1, 2, 0).cpu().numpy()
+
 def run_model_on_tensor(model: torch.nn.Module, tensor_bchw: torch.Tensor) -> torch.Tensor:
-    """Forward pass. Returns CHW in [0,1] on CPU."""
+    """Forward pass. Returns BxCxHxW in [0,1] on CPU."""
     with torch.no_grad():
-        out = model(tensor_bchw.to(DEVICE))[0].cpu()    # CHW in [-1,1]
+        out = model(tensor_bchw.to(DEVICE))
+        # model may return tensor or list; handle both
+        if isinstance(out, (list, tuple)):
+            out = out[0]
+        out = out.detach().cpu()
         out = (out + 1.0) / 2.0
         out = torch.clamp(out, 0.0, 1.0)
-    return out
+    return out  # BxCxHxW
 
 def inference_no_tiling_stride_safe(model: torch.nn.Module, img: Image.Image) -> Image.Image:
-    """Whole image pass after reflect padding up to MODEL_STRIDE multiples."""
     arr = np.array(img)
     arr_pad, (pt, pb, pl, pr) = pad_np_to_multiple_reflect(arr, MODEL_STRIDE)
-    to_tensor = _to_tensor_transform()
-    out_full = run_model_on_tensor(model, to_tensor(Image.fromarray(arr_pad, "RGB")).unsqueeze(0)).permute(1, 2, 0).numpy()
-    out_unpad = out_full[pt:pt+arr.shape[0], pl:pl+arr.shape[1], :]
-    return Image.fromarray((out_unpad * 255.0 + 0.5).astype(np.uint8), mode="RGB")
+    inp = _np_to_input_tensor(arr_pad).unsqueeze(0)
+    out_full = run_model_on_tensor(model, inp)[0]  # CxHxW
+    out_unpad = out_full[:, pt:pt+arr.shape[0], pl:pl+arr.shape[1]]
+    out_np = _tensor_to_uint8_image(out_unpad)
+    return Image.fromarray(out_np, mode="RGB")
 
 # =========================
-# Context aware tiling
+# Batched context aware tiling
+# Requires input padded so each tile = TILE_SIZE and same halo crop size everywhere
 # =========================
-def inference_tiled_halo(model: torch.nn.Module, img: Image.Image,
-                         tile: int, overlap: int, halo: int) -> Image.Image:
-    """
-    For each tile region [x:x+tile, y:y+tile], build a larger reflect padded crop
-    of size tile + 2*halo. Pad this halo crop up to MODEL_STRIDE multiples.
-    Run the model on the padded halo. Remove the pad and crop the center tile.
-    Feather lightly when pasting.
-    """
+def inference_tiled_halo_batched(model: torch.nn.Module, img: Image.Image,
+                                 tile: int, overlap: int, halo: int, batch_sz: int) -> Image.Image:
     W, H = img.size
     base = np.array(img)  # HxWx3
-    to_tensor = _to_tensor_transform()
+
+    # Precompute grid since image is padded to multiple of TILE_SIZE
+    xs = list(range(0, W, tile - overlap))
+    ys = list(range(0, H, tile - overlap))
+    if xs[-1] + tile > W:
+        xs[-1] = W - tile
+    if ys[-1] + tile > H:
+        ys[-1] = H - tile
+
+    # Precompute feather window once
+    win = _hann_window_2d(tile, tile)[..., None].astype(np.float32)
 
     acc = np.zeros((H, W, 3), dtype=np.float32)
     wacc = np.zeros((H, W, 1), dtype=np.float32)
-    win = _hann_window_2d(tile, tile)[..., None].astype(np.float32)
 
+    # Helper to reflect-crop from base
     def crop_with_reflect(arr, x0, y0, x1, y1):
         pad_left = max(0, -x0)
         pad_top = max(0, -y0)
@@ -216,52 +232,67 @@ def inference_tiled_halo(model: torch.nn.Module, img: Image.Image,
             crop = np.pad(crop, ((pad_top, pad_bottom), (pad_left, pad_right), (0, 0)), mode="reflect")
         return crop
 
-    y = 0
-    while True:
-        x = 0
-        tile_h = min(tile, H - y)
-        y0, y1 = y, y + tile_h
-        while True:
-            tile_w = min(tile, W - x)
-            x0, x1 = x, x + tile_w
+    # Collect tiles into batches
+    batch_coords: List[Tuple[int, int, int, int]] = []
+    batch_inputs: List[torch.Tensor] = []
+    ptpbplpr_list: List[Tuple[int, int, int, int]] = []
 
-            # 1) Build halo crop around the tile
+    for y0 in ys:
+        for x0 in xs:
+            y1 = y0 + tile
+            x1 = x0 + tile
+
+            # Halo crop bounds in source coordinates
             hx0, hy0 = x0 - halo, y0 - halo
-            hx1, hy1 = x0 + tile_w + halo, y0 + tile_h + halo
-            halo_arr = crop_with_reflect(base, hx0, hy0, hx1, hy1)
+            hx1, hy1 = x1 + halo, y1 + halo
+            halo_arr = crop_with_reflect(base, hx0, hy0, hx1, hy1)  # shape ~ (tile+2*halo, tile+2*halo, 3)
 
-            # 2) Pad halo crop to MODEL_STRIDE multiples
+            # Pad halo to MODEL_STRIDE multiples to keep UNet happy
             halo_arr_padded, (pt, pb, pl, pr) = pad_np_to_multiple_reflect(halo_arr, MODEL_STRIDE)
-            halo_img = Image.fromarray(halo_arr_padded, "RGB")
 
-            # 3) Forward
-            t = to_tensor(halo_img).unsqueeze(0)
-            out_full = run_model_on_tensor(model, t).permute(1, 2, 0).numpy()
+            # Convert to input tensor and queue
+            batch_inputs.append(_np_to_input_tensor(halo_arr_padded))
+            ptpbplpr_list.append((pt, pb, pl, pr))
+            batch_coords.append((x0, y0, x1, y1))
 
-            # 4) Remove stride pad and crop back to the center tile region
-            Hh, Wh, _ = halo_arr.shape
-            out_unpad = out_full[pt:pt+Hh, pl:pl+Wh, :]
-            out_tile = out_unpad[halo:halo+tile_h, halo:halo+tile_w, :]
+            # Flush batch
+            if len(batch_inputs) == batch_sz:
+                _flush_batch(model, batch_inputs, ptpbplpr_list, batch_coords, acc, wacc, win, tile, halo)
+                batch_inputs.clear()
+                ptpbplpr_list.clear()
+                batch_coords.clear()
 
-            # 5) Feather paste
-            wtile = win[:tile_h, :tile_w, :]
-            acc[y0:y1, x0:x1, :] += out_tile * wtile
-            wacc[y0:y1, x0:x1, :] += wtile
-
-            if x1 >= W:
-                break
-            x = x + tile - overlap
-            if x + 1 >= W:
-                x = W - tile
-
-        if y1 >= H:
-            break
-        y = y + tile - overlap
-        if y + 1 >= H:
-            y = H - tile
+    # Flush remainder
+    if batch_inputs:
+        _flush_batch(model, batch_inputs, ptpbplpr_list, batch_coords, acc, wacc, win, tile, halo)
 
     out = (acc / np.maximum(wacc, 1e-8)).clip(0.0, 1.0)
     return Image.fromarray((out * 255.0 + 0.5).astype(np.uint8), mode="RGB")
+
+def _flush_batch(model: torch.nn.Module,
+                 batch_inputs: List[torch.Tensor],
+                 pad_info: List[Tuple[int, int, int, int]],
+                 coords: List[Tuple[int, int, int, int]],
+                 acc: np.ndarray, wacc: np.ndarray, win: np.ndarray,
+                 tile: int, halo: int) -> None:
+    # Stack to BxCxHxW
+    inp = torch.stack(batch_inputs, dim=0)  # float, [-1,1] already
+    out_full = run_model_on_tensor(model, inp)  # BxCxHxW in [0,1]
+
+    for i in range(out_full.shape[0]):
+        x0, y0, x1, y1 = coords[i]
+        pt, pb, pl, pr = pad_info[i]
+        Hh = (out_full.shape[2] - pt - pb)
+        Wh = (out_full.shape[3] - pl - pr)
+        out_unpad = out_full[i, :, pt:pt+Hh, pl:pl+Wh]  # CxHhWx
+        out_tile = out_unpad[:, halo:halo+tile, halo:halo+tile]    # CxTxT
+
+        out_np = _tensor_to_uint8_image(out_tile)  # HxWx3 uint8
+        out_f = out_np.astype(np.float32) / 255.0
+
+        wtile = win
+        acc[y0:y1, x0:x1, :] += out_f * wtile
+        wacc[y0:y1, x0:x1, :] += wtile
 
 # =========================
 # Model loading
@@ -334,6 +365,26 @@ def _verify_public_url(url: str) -> None:
         raise HTTPException(status_code=400, detail=f"Bad image URL or blocked from server. {e}")
 
 # =========================
+# Utility: decide output format to match input when possible
+# =========================
+def _pick_output_format(pil_img: Image.Image, requested: Optional[str]) -> Tuple[str, str]:
+    """
+    Returns (format_name, mime). Priority:
+    1) requested if valid
+    2) same as input if input format is one of PNG or JPEG
+    3) PNG fallback
+    """
+    valid = {"PNG": "image/png", "JPEG": "image/jpeg"}
+    if requested:
+        fmt = requested.upper()
+        if fmt in valid:
+            return fmt, valid[fmt]
+    in_fmt = (pil_img.format or "").upper()
+    if in_fmt in valid:
+        return in_fmt, valid[in_fmt]
+    return "PNG", "image/png"
+
+# =========================
 # Endpoints
 # =========================
 @app.post("/process")
@@ -350,8 +401,9 @@ async def process(req: ImageRequest):
         content = r.content
         if not content:
             raise HTTPException(status_code=400, detail="Fetched image content is empty.")
-        img = Image.open(io.BytesIO(content)).convert("RGB")
-        logger.info(f"Image opened size=({img.width},{img.height})")
+        img = Image.open(io.BytesIO(content))
+        img = img.convert("RGB")  # unify
+        logger.info(f"Image opened size=({img.width},{img.height}) format={img.format}")
     except HTTPException:
         raise
     except requests.exceptions.Timeout:
@@ -361,31 +413,29 @@ async def process(req: ImageRequest):
     except Exception:
         raise HTTPException(status_code=400, detail="Invalid image data")
 
-    # B. Pad to TILE_SIZE multiple so tiles align
+    # B. Pad to TILE_SIZE multiple so tiles are uniform
     padded_img, meta = pad_to_multiple_reflect(img, TILE_SIZE)
-    logger.info(f"Padded to {padded_img.size} | tile={TILE_SIZE} overlap={TILE_OVERLAP} halo={TILE_HALO}")
+    logger.info(f"Padded to {padded_img.size} | tile={TILE_SIZE} overlap={TILE_OVERLAP} halo={TILE_HALO} batch={TILE_BATCH}")
 
-    # C. Choose full pass for tiny images or context aware tiles
+    # C. Full pass for tiny images or batched halo tiling for everything else
     total_pixels = padded_img.width * padded_img.height
     if total_pixels <= MAX_PIXELS_DIRECT:
         out_padded = inference_no_tiling_stride_safe(netG, padded_img)
     else:
-        out_padded = inference_tiled_halo(netG, padded_img, TILE_SIZE, TILE_OVERLAP, TILE_HALO)
+        out_padded = inference_tiled_halo_batched(netG, padded_img, TILE_SIZE, TILE_OVERLAP, TILE_HALO, TILE_BATCH)
 
-    # D. Restore original dimensions
+    # D. Restore original size
     restored = restore_to_original(out_padded, meta)
 
-    # E. Encode
-    fmt = (req.output_format or DEFAULT_FORMAT).upper()
+    # E. Encode in same format if possible or requested override
+    fmt, mime = _pick_output_format(img, req.output_format)
     buf = io.BytesIO()
     if fmt == "JPEG":
         q = int(req.jpeg_quality or JPEG_QUALITY)
         q = min(max(q, 1), 100)
         restored.save(buf, format="JPEG", quality=q, subsampling=0, optimize=True)
-        mime = "image/jpeg"
     else:
         restored.save(buf, format="PNG", compress_level=3)
-        mime = "image/png"
 
     data_url = f"data:{mime};base64,{base64.b64encode(buf.getvalue()).decode('utf-8')}"
     return JSONResponse(content={"editedImageBase64": data_url})
@@ -402,27 +452,26 @@ async def process_bytes(req: ImageBytesRequest):
         raw = base64.b64decode(b64, validate=True)
         if len(raw) > MAX_BODY_BYTES:
             raise HTTPException(status_code=413, detail="Image too large")
-        img = Image.open(io.BytesIO(raw)).convert("RGB")
-        logger.info(f"Received bytes image size=({img.width},{img.height})")
+        src = Image.open(io.BytesIO(raw))
+        img = src.convert("RGB")
+        logger.info(f"Received bytes image size=({img.width},{img.height}) format={src.format}")
     except HTTPException:
         raise
     except Exception:
         raise HTTPException(status_code=400, detail="Invalid base64 image")
 
     padded_img, meta = pad_to_multiple_reflect(img, TILE_SIZE)
-    out_padded = inference_tiled_halo(netG, padded_img, TILE_SIZE, TILE_OVERLAP, TILE_HALO)
+    out_padded = inference_tiled_halo_batched(netG, padded_img, TILE_SIZE, TILE_OVERLAP, TILE_HALO, TILE_BATCH)
     restored = restore_to_original(out_padded, meta)
 
-    fmt = (req.output_format or DEFAULT_FORMAT).upper()
+    fmt, mime = _pick_output_format(src, req.output_format)
     buf = io.BytesIO()
     if fmt == "JPEG":
         q = int(req.jpeg_quality or JPEG_QUALITY)
         q = min(max(q, 1), 100)
         restored.save(buf, format="JPEG", quality=q, subsampling=0, optimize=True)
-        mime = "image/jpeg"
     else:
         restored.save(buf, format="PNG", compress_level=3)
-        mime = "image/png"
 
     data_url = f"data:{mime};base64,{base64.b64encode(buf.getvalue()).decode('utf-8')}"
     return JSONResponse(content={"editedImageBase64": data_url})
